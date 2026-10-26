@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Bedrock managed knowledge base (service-managed vector store and embeddings)
+  with an S3 bucket as data source. The Outputs section prints the values to paste into
+  the local Streamlit .env file.
+
+Parameters:
+  GenerationModelId:
+    Type: String
+    Default: us.amazon.nova-pro-v1:0
+    Description: >
+      Model or inference profile ID the chat app uses to generate answers
+      (used only to build the DEFAULT_MODEL_ARN output). Use a "us." profile in US regions,
+      "eu." in EU regions, etc.
+
+Resources:
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+      Policies:
+        - PolicyName: ReadDocumentsBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ListBucketStatement
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DocumentsBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: S3GetObjectStatement
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${DocumentsBucket.Arn}/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub ${AWS::StackName}-managed-kb
+      Description: Managed knowledge base over documents in S3
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: MANAGED
+        ManagedKnowledgeBaseConfiguration:
+          EmbeddingModelType: MANAGED
+
+  DataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBase
+      Name: s3-documents
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: MANAGED_KNOWLEDGE_BASE_CONNECTOR
+        ManagedKnowledgeBaseConnectorConfiguration:
+          ConnectorParameters:
+            type: S3
+            version: '1'
+            connectionConfiguration:
+              bucketName: !Ref DocumentsBucket
+              bucketOwnerAccountId: !Ref AWS::AccountId
+          DeletionProtectionConfiguration:
+            DeletionProtectionStatus: DISABLED
+
+Outputs:
+  EnvFile:
+    Description: Copy this block into the local .env file
+    Value: !Sub |
+      AWS_REGION=${AWS::Region}
+      BEDROCK_KNOWLEDGE_BASE_ID=${KnowledgeBase}
+      DEFAULT_MODEL_ARN=arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${GenerationModelId}
+      TOP_K_RESULTS=5
+
+  UploadDocuments:
+    Description: Step 1 - upload the sample documents (run from the project folder)
+    Value: !Sub aws s3 sync ./sample_data s3://${DocumentsBucket}/ --region ${AWS::Region}
+
+  StartIngestion:
+    Description: Step 2 - index the uploaded documents (re-run after every upload)
+    Value: !Sub aws bedrock-agent start-ingestion-job --knowledge-base-id ${KnowledgeBase} --data-source-id ${DataSource.DataSourceId} --region ${AWS::Region}
+
+  KnowledgeBaseId:
+    Value: !Ref KnowledgeBase
+
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
